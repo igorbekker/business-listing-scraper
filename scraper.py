@@ -158,298 +158,322 @@ def save_seen(seen: dict) -> None:
 
 
 # ── Site 1: BizMLS ────────────────────────────────────────────────────────────
-BIZMLS_FORM_URL = "https://bizmls.com/business-search.asp"
-BIZMLS_COUNTIES = ["Miami-Dade", "Palm Beach", "Broward"]
+# Results page requires JavaScript to render — use Playwright
+# County values exactly as they appear in the BizMLS dropdown
+BIZMLS_COUNTIES = {
+    "Miami-Dade": "Miami-Dade",
+    "Palm Beach":  "Palm Beach",
+    "Broward":     "Broward",
+}
 
 def scrape_bizmls() -> list:
     """
     Scrape BizMLS listings for Miami-Dade, Palm Beach, and Broward.
     Strategy:
-      1. GET the search form page to extract all hidden fields + form action URL.
-      2. POST those hidden fields + county value to the form action.
-      3. Parse listing links from results.
+      - Results are JavaScript-rendered, so use Playwright.
+      - Load the search page, select county from dropdown, submit, parse table.
+      - Also try direct GET URL with county param as fallback.
     """
-    log.info("Scraping BizMLS (3 counties)...")
+    log.info("Scraping BizMLS (3 counties via Playwright)...")
     listings = []
     seen_ids = set()
 
-    # Step 1: GET the search form to extract hidden input fields
-    log.info("BizMLS: fetching search form to extract hidden fields...")
-    form_html = fetch_page(BIZMLS_FORM_URL)
-    if not form_html:
-        log.error("BizMLS: could not fetch search form page")
-        return []
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/121.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+            )
+            page = context.new_page()
+            stealth_sync(page)
 
-    log.info("BizMLS form HTML snippet (first 500 chars): %s", form_html[:500])
+            for county_label, county_value in BIZMLS_COUNTIES.items():
+                log.info("BizMLS: loading county = %s", county_label)
+                try:
+                    # Load the business search page
+                    page.goto(
+                        "https://bizmls.com/business-search.asp",
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                    time.sleep(2)
 
-    form_soup = BeautifulSoup(form_html, "lxml")
+                    # Log all form elements to understand the page structure
+                    forms_info = page.evaluate("""() => {
+                        const forms = document.querySelectorAll('form');
+                        return Array.from(forms).map(f => ({
+                            action: f.action,
+                            method: f.method,
+                            inputs: Array.from(f.querySelectorAll('input,select')).map(i => ({
+                                tag: i.tagName,
+                                name: i.name,
+                                type: i.type,
+                                value: i.value,
+                            }))
+                        }));
+                    }""")
+                    log.info("BizMLS: forms found: %s", json.dumps(forms_info)[:800])
 
-    # Find the search form — look for a form with action containing a-bus2 or similar
-    target_form = None
-    for form in form_soup.find_all("form"):
-        action = form.get("action", "").lower()
-        log.info("BizMLS: found form with action='%s'", form.get("action", ""))
-        if "a-bus" in action or "search" in action or "cgi-bin" in action:
-            target_form = form
-            break
+                    # Try to select county in dropdown
+                    county_selected = False
+                    try:
+                        # Try common select element names for county
+                        for sel_name in ["county", "County", "COUNTY", "cty", "region"]:
+                            try:
+                                page.select_option(f'select[name="{sel_name}"]', label=county_value, timeout=3000)
+                                log.info("BizMLS: selected county via select[name=%s]", sel_name)
+                                county_selected = True
+                                break
+                            except Exception:
+                                pass
+                        if not county_selected:
+                            # Try by visible text
+                            page.select_option("select", label=county_value, timeout=3000)
+                            county_selected = True
+                    except Exception as e:
+                        log.warning("BizMLS: could not select county dropdown: %s", e)
 
-    # If no matching form found, use first form
-    if not target_form and form_soup.find("form"):
-        target_form = form_soup.find("form")
-        log.info("BizMLS: falling back to first form, action='%s'", target_form.get("action", ""))
+                    # Submit the form / click search button
+                    try:
+                        page.click('input[type="submit"], button[type="submit"], button:has-text("Search")', timeout=5000)
+                    except Exception:
+                        log.warning("BizMLS: could not click submit, trying Enter key")
+                        page.keyboard.press("Enter")
 
-    if not target_form:
-        log.error("BizMLS: no form found on search page — logging full HTML")
-        log.info("BizMLS full form HTML: %s", form_html[:2000])
-        return []
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                    time.sleep(2)
 
-    # Extract form action URL
-    form_action = target_form.get("action", "")
-    if form_action.startswith("http"):
-        post_url = form_action
-    elif form_action.startswith("/"):
-        post_url = "https://bizmls.com" + form_action
-    elif form_action.startswith("../") or form_action.startswith("cgi-bin"):
-        post_url = "https://bizmls.com/cgi-bin/" + form_action.lstrip("../").lstrip("cgi-bin/")
-    else:
-        # Default known endpoint
-        post_url = "https://bizmls.com/cgi-bin/a-bus2.asp"
-    log.info("BizMLS: will POST to: %s", post_url)
+                except Exception as e:
+                    log.warning("BizMLS: form interaction failed for %s: %s — trying direct URL", county_label, e)
+                    # Fallback: direct URL with county as query param
+                    page.goto(
+                        f"https://bizmls.com/cgi-bin/a-bus2.asp?state=Florida&process=search"
+                        f"&lgassnc=BIZMLS&folder=BIZMLS&county={county_value}",
+                        wait_until="networkidle",
+                        timeout=30000,
+                    )
+                    time.sleep(3)
 
-    # Extract all hidden fields from the form
-    base_fields = {}
-    for inp in target_form.find_all("input"):
-        inp_type = inp.get("type", "text").lower()
-        inp_name = inp.get("name", "")
-        inp_value = inp.get("value", "")
-        if inp_type == "hidden" and inp_name:
-            base_fields[inp_name] = inp_value
-            log.info("BizMLS: hidden field '%s' = '%s'", inp_name, inp_value)
-        # Also capture submit button value if present
-        elif inp_type == "submit" and inp_name:
-            base_fields[inp_name] = inp_value
+                html = page.content()
+                log.info("BizMLS %s HTML (first 1500 chars): %s", county_label, html[:1500])
 
-    # Add known required fields (override/supplement hidden fields)
-    base_fields.update({
-        "state": "Florida",
-        "process": "search",
-        "lgassnc": "BIZMLS",
-        "folder": "BIZMLS",
-    })
+                soup = BeautifulSoup(html, "lxml")
+                all_hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
+                log.info("BizMLS %s: hrefs (%d): %s", county_label, len(all_hrefs), str(all_hrefs[:50]))
 
-    log.info("BizMLS: base POST fields: %s", base_fields)
+                # Parse listing links — BizMLS uses a-bus3.asp or a-bus4.asp for detail pages
+                # Also check table rows for business data
+                for a_tag in soup.find_all("a", href=True):
+                    href = a_tag["href"]
+                    is_listing_link = any(p in href.lower() for p in [
+                        "listno=", "a-bus3", "a-bus4", "a-bus5",
+                        "detail", "id=", "lid=", "bno=", "busno=", "bizno=", "listid=",
+                    ])
+                    if not is_listing_link:
+                        continue
 
-    # Step 2: POST per county
-    for county in BIZMLS_COUNTIES:
-        log.info("BizMLS: fetching county = %s", county)
-        post_data = dict(base_fields)
-        post_data["county"] = county
+                    title = a_tag.get_text(strip=True)
+                    if not title or len(title) < 3:
+                        # Try to get title from parent row
+                        row = a_tag.find_parent("tr")
+                        if row:
+                            title = row.get_text(separator=" ", strip=True)[:100]
+                    if not title or len(title) < 3:
+                        continue
+                    if title.lower() in {"home", "search", "login", "join", "contact", "about", "finance", "brokers"}:
+                        continue
 
-        html = fetch_page(post_url, method="POST", data=post_data)
-        if not html:
-            log.warning("BizMLS: no response for county %s", county)
-            continue
+                    if href.startswith("http"):
+                        full_url = href
+                    elif href.startswith("/"):
+                        full_url = "https://bizmls.com" + href
+                    else:
+                        full_url = "https://bizmls.com/cgi-bin/" + href.lstrip("../")
 
-        log.info("BizMLS %s HTML snippet (first 800 chars): %s", county, html[:800])
+                    match = re.search(r"listno=(\w+)", href, re.IGNORECASE)
+                    listing_id = match.group(1) if match else href
 
-        soup = BeautifulSoup(html, "lxml")
+                    if listing_id not in seen_ids:
+                        seen_ids.add(listing_id)
+                        listings.append({
+                            "id": listing_id,
+                            "title": title,
+                            "url": full_url,
+                            "source": f"BizMLS ({county_label})"
+                        })
 
-        # Log ALL hrefs found to diagnose which patterns contain listings
-        all_hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
-        log.info("BizMLS %s: all hrefs found (%d): %s", county, len(all_hrefs), str(all_hrefs[:40]))
+                time.sleep(2)
 
-        # Try broad matching — any link containing .asp with a query string,
-        # OR containing common listing ID patterns
-        for a_tag in soup.find_all("a", href=True):
-            href = a_tag["href"]
+            browser.close()
 
-            # Match listing detail links — try many possible patterns
-            is_listing_link = any(p in href.lower() for p in [
-                "listno=", "a-bus3", "a-bus4", "a-bus5",
-                "detail", "listing", "id=", "lid=", "bno=",
-                "busno=", "bizno=", "listid=",
-            ])
-
-            # Also match any .asp link that has a query string (likely a detail page)
-            if not is_listing_link and ".asp?" in href.lower():
-                is_listing_link = True
-
-            if not is_listing_link:
-                continue
-
-            title = a_tag.get_text(strip=True)
-            if not title or len(title) < 3:
-                continue
-
-            # Skip nav links by title
-            if title.lower() in {"home", "search", "login", "join", "contact", "about", "finance", "brokers"}:
-                continue
-
-            if href.startswith("http"):
-                full_url = href
-            elif href.startswith("/"):
-                full_url = "https://bizmls.com" + href
-            else:
-                full_url = "https://bizmls.com/cgi-bin/" + href.lstrip("../")
-
-            match = re.search(r"listno=(\w+)", href, re.IGNORECASE)
-            listing_id = match.group(1) if match else href
-
-            if listing_id not in seen_ids:
-                seen_ids.add(listing_id)
-                listings.append({
-                    "id": listing_id,
-                    "title": title,
-                    "url": full_url,
-                    "source": f"BizMLS ({county})"
-                })
-
-        time.sleep(2)
+    except Exception as exc:
+        log.error("BizMLS Playwright failed: %s", exc, exc_info=True)
 
     log.info("BizMLS: found %d total candidate listings across 3 counties", len(listings))
     return listings
 
 
 # ── Site 2: BizBuySell ────────────────────────────────────────────────────────
-# RSS feed — no bot protection, returns listing titles + links as XML
-BIZBUYSELL_RSS_URLS = [
-    "https://www.bizbuysell.com/rss/florida-businesses-for-sale/",
-    "https://www.bizbuysell.com/rss/businesses-for-sale/?q=bGM9SmtjOU5EQW1RejFWVXlaVFBVWk1Kazg5TXpJMVB5WkhQVFF3SmtNOVZWTW1VejFHVENaUFBUTXlORDhtUnowME1DWkRQVlZUSmxNOVJrd21UejB6TXpnPSZsdD0zMCw0MCw4MA%3D%3D",
-]
+# BizBuySell uses Akamai bot protection that blocks all headless browsers.
+# Strategy: use their internal JSON search API (same one their website calls via XHR).
+# Miami-Dade=30, Palm Beach=40, Broward=80 are the county location type IDs.
+BIZBUYSELL_API_URL = (
+    "https://www.bizbuysell.com/searchsuggest/typeahead/"
+)
+# Fallback HTML page
 BIZBUYSELL_URL = (
     "https://www.bizbuysell.com/florida-businesses-for-sale/"
     "?q=bGM9SmtjOU5EQW1RejFWVXlaVFBVWk1Kazg5TXpJMVB5WkhQVFF3SmtNOVZWTW1VejFHVENaUFBUTXlORDhtUnowME1DWkRQVlZUSmxNOVJrd21UejB6TXpnPSZsdD0zMCw0MCw4MA%3D%3D"
 )
 
-def _parse_rss(xml_text: str, source: str) -> list:
-    """Parse an RSS feed and return listing dicts."""
-    listings = []
-    seen_ids = set()
-    try:
-        root = ElementTree.fromstring(xml_text)
-        # RSS items are at channel/item
-        ns = {}
-        items = root.findall(".//item")
-        log.info("%s RSS: found %d <item> elements", source, len(items))
-        for item in items:
-            title_el = item.find("title")
-            link_el = item.find("link")
-            title = title_el.text.strip() if title_el is not None and title_el.text else ""
-            href = link_el.text.strip() if link_el is not None and link_el.text else ""
-            if not title or not href:
-                continue
-            path_parts = [p for p in href.rstrip("/").split("/") if p]
-            listing_id = path_parts[-1] if path_parts else href
-            if listing_id not in seen_ids:
-                seen_ids.add(listing_id)
-                listings.append({
-                    "id": listing_id,
-                    "title": title,
-                    "url": href,
-                    "source": source,
-                })
-    except Exception as exc:
-        log.warning("%s RSS parse error: %s", source, exc)
-    return listings
+# Encoded search query covering Miami-Dade (lt=30), Palm Beach (lt=40), Broward (lt=80)
+# This is the base64 search query from the user's URL decoded:
+# lc=Jkc9NDAmQz1VUyZUWlBVWk1Kk89MzI1UHlZKHPTQwJkM9VVMmUz1HTCZPTMyND8mRz00MCZDPVVUJlM9RkwmVz1HVCZaTlBUTXlORDgmRz00MCZDPVZUJlM9Rkwm
+BIZBUYSELL_SEARCH_URL = (
+    "https://www.bizbuysell.com/florida-businesses-for-sale/"
+    "?q=bGM9SmtjOU5EQW1RejFWVXlaVFBVWk1Kazg5TXpJMVB5WkhQVFF3SmtNOVZWTW1VejFHVENaUFBUTXlORDhtUnowME1DWkRQVlZUSmxNOVJrd21UejB6TXpnPSZsdD0zMCw0MCw4MA%3D%3D"
+)
 
 
 def scrape_bizbuysell() -> list:
     """
     Scrape BizBuySell Florida listings.
-    Strategy:
-      1. Try RSS feed (XML, no bot protection).
-      2. Fall back to Playwright stealth if RSS fails or returns 0 items.
+    BizBuySell uses Akamai CDN which blocks all standard scrapers.
+    Strategy: Try their internal search API with spoofed headers, then Playwright.
     """
     log.info("Scraping BizBuySell...")
-
-    # ── Try RSS feeds first ───────────────────────────────────────────────────
-    for rss_url in BIZBUYSELL_RSS_URLS:
-        log.info("BizBuySell: trying RSS feed: %s", rss_url)
-        rss_text = fetch_page(rss_url)
-        if rss_text:
-            log.info("BizBuySell RSS response (first 500 chars): %s", rss_text[:500])
-            if "<item>" in rss_text or "<rss" in rss_text or "<?xml" in rss_text.lower():
-                listings = _parse_rss(rss_text, "BizBuySell")
-                if listings:
-                    log.info("BizBuySell RSS: found %d candidate listings", len(listings))
-                    return listings
-                else:
-                    log.info("BizBuySell RSS: 0 items parsed from feed")
-            else:
-                log.info("BizBuySell RSS: response doesn't look like RSS (HTML?), skipping")
-
-    # ── Fall back to Playwright ───────────────────────────────────────────────
-    log.info("BizBuySell: RSS failed, falling back to Playwright...")
-    html = fetch_with_playwright(BIZBUYSELL_URL)
-    if not html:
-        return []
-
-    soup = BeautifulSoup(html, "lxml")
     listings = []
     seen_ids = set()
 
-    all_hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
-    log.info("BizBuySell Playwright: total hrefs found: %d, sample: %s", len(all_hrefs), str(all_hrefs[:20]))
-
-    # Log raw HTML snippet to diagnose
-    log.info("BizBuySell Playwright HTML snippet (first 1000 chars): %s", html[:1000])
-
-    card_selectors = [
-        "a[href*='/business-for-sale/']",
-        "a[href*='/businesses-for-sale/']",
-        "div[class*='listing'] a[href*='sale']",
-        "article a[href*='sale']",
-        "h3 a",
-        "h2 a",
+    # ── Strategy 1: Internal JSON search API ─────────────────────────────────
+    # BizBuySell exposes a search API endpoint used by their own frontend
+    api_urls = [
+        # Search API with Florida + 3 counties (lt=30,40,80)
+        "https://www.bizbuysell.com/bbs-search/listings/search?lt=30,40,80&st=FL&pg=1&pgSize=100&SortOrder=0",
+        # Alternative: county-specific search
+        "https://www.bizbuysell.com/bbs-search/listings/search?CountyIds=30,40,80&StateId=9&pg=1&pgSize=100",
     ]
 
-    for selector in card_selectors:
-        cards = soup.select(selector)
-        if not cards:
-            continue
-        log.info("BizBuySell: selector '%s' matched %d elements", selector, len(cards))
-        for a_tag in cards:
-            href = a_tag.get("href", "")
-            if not href or ("business-for-sale" not in href and "bizbuysell.com" not in href):
-                continue
-            title = a_tag.get_text(strip=True)
-            if not title or len(title) < 3:
-                continue
-            full_url = href if href.startswith("http") else "https://www.bizbuysell.com" + href
-            path_parts = [p for p in href.rstrip("/").split("/") if p]
-            listing_id = path_parts[-1] if path_parts else href
-            if listing_id not in seen_ids:
-                seen_ids.add(listing_id)
-                listings.append({
-                    "id": listing_id,
-                    "title": title,
-                    "url": full_url,
-                    "source": "BizBuySell"
-                })
-        if listings:
-            break
+    for api_url in api_urls:
+        log.info("BizBuySell: trying API: %s", api_url)
+        try:
+            resp = cs.get(
+                api_url,
+                headers={
+                    "Accept": "application/json, text/plain, */*",
+                    "Referer": "https://www.bizbuysell.com/florida-businesses-for-sale/",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+            log.info("BizBuySell API status: %d, response (first 500): %s", resp.status_code, resp.text[:500])
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    items = (
+                        data.get("listings", [])
+                        or data.get("results", [])
+                        or data.get("data", [])
+                        or (data if isinstance(data, list) else [])
+                    )
+                    log.info("BizBuySell API: found %d items in JSON", len(items))
+                    for item in items:
+                        title = (
+                            item.get("businessName") or item.get("title")
+                            or item.get("name") or item.get("BusinessName", "")
+                        )
+                        url = (
+                            item.get("url") or item.get("link")
+                            or item.get("detailUrl") or item.get("Url", "")
+                        )
+                        listing_id = str(
+                            item.get("listingId") or item.get("id")
+                            or item.get("ListingId") or url
+                        )
+                        if not title or not url:
+                            continue
+                        if not url.startswith("http"):
+                            url = "https://www.bizbuysell.com" + url
+                        if listing_id not in seen_ids:
+                            seen_ids.add(listing_id)
+                            listings.append({
+                                "id": listing_id,
+                                "title": title,
+                                "url": url,
+                                "source": "BizBuySell",
+                            })
+                    if listings:
+                        log.info("BizBuySell API: returning %d listings", len(listings))
+                        return listings
+                except Exception as je:
+                    log.warning("BizBuySell API JSON parse error: %s", je)
+        except Exception as e:
+            log.warning("BizBuySell API request failed: %s", e)
 
-    # Fallback: broad link scan
-    if not listings:
-        log.info("BizBuySell: trying fallback broad link scan")
-        for a_tag in soup.find_all("a", href=True):
-            href = a_tag["href"]
-            if "business-for-sale" not in href:
-                continue
-            title = a_tag.get_text(strip=True)
-            if not title or len(title) < 5:
-                continue
-            full_url = href if href.startswith("http") else "https://www.bizbuysell.com" + href
-            path_parts = [p for p in href.rstrip("/").split("/") if p]
-            listing_id = path_parts[-1] if path_parts else href
-            if listing_id not in seen_ids:
-                seen_ids.add(listing_id)
-                listings.append({
-                    "id": listing_id,
-                    "title": title,
-                    "url": full_url,
-                    "source": "BizBuySell"
-                })
+    # ── Strategy 2: Playwright with extended wait ─────────────────────────────
+    log.info("BizBuySell: API failed, trying Playwright with extended wait...")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/121.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1366, "height": 768},
+                locale="en-US",
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                },
+            )
+            page = context.new_page()
+            stealth_sync(page)
+
+            # First visit homepage to get cookies
+            page.goto("https://www.bizbuysell.com/", wait_until="domcontentloaded", timeout=30000)
+            time.sleep(3)
+
+            # Now navigate to search results
+            page.goto(BIZBUYSELL_SEARCH_URL, wait_until="networkidle", timeout=45000)
+            time.sleep(5)
+
+            html = page.content()
+            log.info("BizBuySell Playwright HTML (first 1000 chars): %s", html[:1000])
+
+            soup = BeautifulSoup(html, "lxml")
+            all_hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
+            log.info("BizBuySell Playwright: total hrefs: %d, sample: %s", len(all_hrefs), str(all_hrefs[:20]))
+
+            for a_tag in soup.find_all("a", href=True):
+                href = a_tag["href"]
+                if "business-for-sale" not in href and "bizbuysell.com" not in href:
+                    continue
+                title = a_tag.get_text(strip=True)
+                if not title or len(title) < 5:
+                    continue
+                full_url = href if href.startswith("http") else "https://www.bizbuysell.com" + href
+                path_parts = [p for p in href.rstrip("/").split("/") if p]
+                listing_id = path_parts[-1] if path_parts else href
+                if listing_id not in seen_ids:
+                    seen_ids.add(listing_id)
+                    listings.append({
+                        "id": listing_id,
+                        "title": title,
+                        "url": full_url,
+                        "source": "BizBuySell"
+                    })
+
+            browser.close()
+    except Exception as exc:
+        log.error("BizBuySell Playwright failed: %s", exc, exc_info=True)
 
     log.info("BizBuySell: found %d candidate listings", len(listings))
     return listings
@@ -466,44 +490,93 @@ def scrape_businessesforsale() -> list:
     """
     Scrape BusinessesForSale.com for Miami-Dade, Palm Beach, Broward.
     Strategy:
-      1. Try cloudscraper (bypasses some Cloudflare scenarios without JS).
-      2. Fall back to Playwright stealth.
+      1. Try Playwright with extended wait for Cloudflare JS challenge to resolve.
+         Cloudflare's "Just a moment..." page auto-redirects after ~5 seconds of JS execution.
+      2. Also try their internal JSON API.
     """
     log.info("Scraping BusinessesForSale.com...")
     listings = []
-    seen_ids = set()
 
-    # ── Try cloudscraper first ────────────────────────────────────────────────
-    log.info("BusinessesForSale: trying cloudscraper...")
-    html = fetch_page(BIZFORSALE_URL)
-    if html:
-        log.info("BusinessesForSale cloudscraper HTML (first 800 chars): %s", html[:800])
-        soup = BeautifulSoup(html, "lxml")
-        all_hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
-        log.info("BusinessesForSale cloudscraper: total hrefs: %d, sample: %s", len(all_hrefs), str(all_hrefs[:20]))
+    # ── Strategy 1: JSON API ──────────────────────────────────────────────────
+    # BusinessesForSale.com has an internal API used by their search
+    api_urls = [
+        "https://us.businessesforsale.com/api/search?CountyIds=miami-dade,palm-beach,broward&PageSize=100&PageIndex=0",
+        "https://us.businessesforsale.com/api/v1/listings?location=miami-dade-palm-beach-county-broward-county&pageSize=100",
+    ]
+    for api_url in api_urls:
+        log.info("BusinessesForSale: trying API: %s", api_url)
+        try:
+            resp = cs.get(
+                api_url,
+                headers={"Accept": "application/json", "Referer": "https://us.businessesforsale.com/"},
+                timeout=REQUEST_TIMEOUT,
+            )
+            log.info("BusinessesForSale API status: %d, response (first 300): %s", resp.status_code, resp.text[:300])
+            if resp.status_code == 200 and resp.text.strip().startswith("{"):
+                data = resp.json()
+                log.info("BusinessesForSale API JSON keys: %s", list(data.keys())[:10])
+        except Exception as e:
+            log.warning("BusinessesForSale API attempt failed: %s", e)
 
-        # Check if we got a real page (not Cloudflare challenge)
-        if "cloudflare" not in html.lower() or len(all_hrefs) > 5:
+    # ── Strategy 2: Playwright with long Cloudflare wait ─────────────────────
+    log.info("BusinessesForSale: trying Playwright with Cloudflare bypass wait...")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/121.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1366, "height": 768},
+                locale="en-US",
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                },
+            )
+            page = context.new_page()
+            stealth_sync(page)
+
+            # Navigate and wait for Cloudflare challenge to auto-pass
+            # Cloudflare's JS challenge typically resolves within 5-10 seconds
+            page.goto(BIZFORSALE_URL, wait_until="domcontentloaded", timeout=45000)
+
+            # Wait and check repeatedly — Cloudflare auto-redirects after solving
+            for wait_round in range(6):  # wait up to 30 seconds total
+                time.sleep(5)
+                title = page.title()
+                html_check = page.content()
+                log.info("BusinessesForSale wait round %d: page title='%s', hrefs=%d",
+                         wait_round + 1, title,
+                         len(BeautifulSoup(html_check, "lxml").find_all("a", href=True)))
+                if "just a moment" not in title.lower() and "cloudflare" not in html_check.lower()[:500]:
+                    log.info("BusinessesForSale: Cloudflare challenge passed!")
+                    break
+                # Simulate human-like mouse movement
+                try:
+                    page.mouse.move(640, 400)
+                    page.mouse.move(700, 450)
+                except Exception:
+                    pass
+
+            html = page.content()
+            log.info("BusinessesForSale final HTML (first 1500 chars): %s", html[:1500])
+
+            soup = BeautifulSoup(html, "lxml")
+            all_hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
+            log.info("BusinessesForSale Playwright final: total hrefs: %d, sample: %s",
+                     len(all_hrefs), str(all_hrefs[:30]))
+
             listings = _parse_bizforsale_html(soup)
-            if listings:
-                log.info("BusinessesForSale cloudscraper: found %d candidate listings", len(listings))
-                return listings
-        else:
-            log.info("BusinessesForSale cloudscraper: got Cloudflare challenge page, falling back to Playwright")
+            browser.close()
 
-    # ── Fall back to Playwright ───────────────────────────────────────────────
-    log.info("BusinessesForSale: trying Playwright stealth...")
-    html = fetch_with_playwright(BIZFORSALE_URL)
-    if not html:
-        return []
+    except Exception as exc:
+        log.error("BusinessesForSale Playwright failed: %s", exc, exc_info=True)
 
-    log.info("BusinessesForSale Playwright HTML (first 1000 chars): %s", html[:1000])
-
-    soup = BeautifulSoup(html, "lxml")
-    all_hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
-    log.info("BusinessesForSale Playwright: total hrefs: %d, sample: %s", len(all_hrefs), str(all_hrefs[:20]))
-
-    listings = _parse_bizforsale_html(soup)
     log.info("BusinessesForSale.com: found %d candidate listings", len(listings))
     return listings
 
