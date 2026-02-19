@@ -16,7 +16,7 @@ from email.mime.text import MIMEText
 from datetime import datetime
 from typing import Optional
 
-import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -25,6 +25,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 log = logging.getLogger(__name__)
+
+# ── Shared cloudscraper instance (bypasses Cloudflare/bot protection) ─────────
+scraper = cloudscraper.create_scraper(
+    browser={"browser": "chrome", "platform": "windows", "mobile": False}
+)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 KEYWORDS = [
@@ -37,36 +42,24 @@ GMAIL_USER = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 RECIPIENT = "bekker.igor@gmail.com"
 
-REQUEST_TIMEOUT = 15        # seconds per request
+REQUEST_TIMEOUT = 20        # seconds per request
 RETRY_ATTEMPTS = 3
-RETRY_DELAY = 5             # seconds between retries
-INTER_SITE_DELAY = 3        # seconds between sites
-
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/121.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-}
+RETRY_DELAY = 6             # seconds between retries
+INTER_SITE_DELAY = 4        # seconds between sites
 
 
-# ── Utility: HTTP fetch with retry ────────────────────────────────────────────
-def fetch_page(url: str, headers: dict = None, session=None) -> Optional[str]:
-    """Fetch URL with retry logic. Returns HTML text or None on failure."""
-    hdrs = {**DEFAULT_HEADERS, **(headers or {})}
-    fetcher = session or requests
+# ── Utility: fetch with retry ──────────────────────────────────────────────────
+def fetch_page(url: str, method: str = "GET", data: dict = None) -> Optional[str]:
+    """Fetch URL with retry logic using cloudscraper. Returns HTML or None."""
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            resp = fetcher.get(url, headers=hdrs, timeout=REQUEST_TIMEOUT)
+            if method == "POST":
+                resp = scraper.post(url, data=data, timeout=REQUEST_TIMEOUT)
+            else:
+                resp = scraper.get(url, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             return resp.text
-        except requests.RequestException as exc:
+        except Exception as exc:
             log.warning("Attempt %d/%d failed for %s: %s", attempt, RETRY_ATTEMPTS, url, exc)
             if attempt < RETRY_ATTEMPTS:
                 time.sleep(RETRY_DELAY)
@@ -99,69 +92,85 @@ def save_seen(seen: dict) -> None:
 
 
 # ── Site 1: BizMLS ────────────────────────────────────────────────────────────
-BIZMLS_URL = (
-    "https://bizmls.com/cgi-bin/a-bus2.asp"
-    "?state=Florida&process=search&lgassnc=BIZMLS&folder=BIZMLS"
-)
+# BizMLS uses a POST form to return results, filtered by county.
+# We submit 3 separate POST requests for Miami-Dade, Palm Beach, and Broward.
+BIZMLS_POST_URL = "https://bizmls.com/cgi-bin/a-bus2.asp"
+BIZMLS_COUNTIES = ["Miami-Dade", "Palm Beach", "Broward"]
 
 def scrape_bizmls() -> list:
-    """Scrape BizMLS Florida listings."""
-    log.info("Scraping BizMLS...")
-    html = fetch_page(BIZMLS_URL)
-    if not html:
-        return []
-
-    soup = BeautifulSoup(html, "lxml")
+    """Scrape BizMLS listings for Miami-Dade, Palm Beach, and Broward counties."""
+    log.info("Scraping BizMLS (3 counties)...")
     listings = []
+    seen_ids = set()
 
-    for a_tag in soup.find_all("a", href=True):
-        href = a_tag["href"]
-        if "listno=" not in href and "a-bus3" not in href:
+    for county in BIZMLS_COUNTIES:
+        log.info("BizMLS: fetching county = %s", county)
+        post_data = {
+            "state": "Florida",
+            "process": "search",
+            "lgassnc": "BIZMLS",
+            "folder": "BIZMLS",
+            "county": county,
+        }
+        html = fetch_page(BIZMLS_POST_URL, method="POST", data=post_data)
+        if not html:
+            log.warning("BizMLS: no response for county %s", county)
             continue
-        title = a_tag.get_text(strip=True)
-        if not title or len(title) < 3:
-            continue
 
-        if href.startswith("http"):
-            full_url = href
-        else:
-            full_url = "https://bizmls.com/cgi-bin/" + href.lstrip("/")
+        # Debug: show first 300 chars to verify we got results not just a form
+        log.info("BizMLS %s HTML preview: %s", county, html[:300].replace("\n", " "))
 
-        match = re.search(r"listno=(\w+)", href, re.IGNORECASE)
-        listing_id = match.group(1) if match else href
+        soup = BeautifulSoup(html, "lxml")
 
-        listings.append({
-            "id": listing_id,
-            "title": title,
-            "url": full_url,
-            "source": "BizMLS"
-        })
+        # Scan all <a> tags — listing links typically contain listno= or a-bus3.asp
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag["href"]
 
-    log.info("BizMLS: found %d candidate listings", len(listings))
+            # Match any link that looks like a listing detail page
+            if not any(p in href for p in ["listno=", "a-bus3", "a-bus4", "detail"]):
+                continue
+
+            title = a_tag.get_text(strip=True)
+            if not title or len(title) < 3:
+                continue
+
+            # Build absolute URL
+            if href.startswith("http"):
+                full_url = href
+            elif href.startswith("/"):
+                full_url = "https://bizmls.com" + href
+            else:
+                full_url = "https://bizmls.com/cgi-bin/" + href
+
+            # Use listno value as ID, fall back to full href
+            match = re.search(r"listno=(\w+)", href, re.IGNORECASE)
+            listing_id = match.group(1) if match else href
+
+            if listing_id not in seen_ids:
+                seen_ids.add(listing_id)
+                listings.append({
+                    "id": listing_id,
+                    "title": title,
+                    "url": full_url,
+                    "source": f"BizMLS ({county})"
+                })
+
+        time.sleep(2)  # small delay between county requests
+
+    log.info("BizMLS: found %d total candidate listings across 3 counties", len(listings))
     return listings
 
 
 # ── Site 2: BizBuySell ────────────────────────────────────────────────────────
 BIZBUYSELL_URL = (
     "https://www.bizbuysell.com/florida-businesses-for-sale/"
-    "?q=bGM9SmtjOU5EQW1RejFWVXlaVFBVWk1Lazg5TXpNNFB5WkhQVFF3SmtNOVZWTW1UejFHVENaUFBUTXlORDhtUnowME1DWkRQVlZUSmxNOVJrd21UejB6TWpVPSZsdD0zMCw0MCw4MA%3D%3D"
+    "?q=bGM9SmtjOU5EQW1RejFWVXlaVFBVWk1Kazg5TXpJMVB5WkhQVFF3SmtNOVZWTW1VejFHVENaUFBUTXlORDhtUnowME1DWkRQVlZUSmxNOVJrd21UejB6TXpnPSZsdD0zMCw0MCw4MA%3D%3D"
 )
 
 def scrape_bizbuysell() -> list:
     """Scrape BizBuySell Florida listings."""
     log.info("Scraping BizBuySell...")
-
-    session = requests.Session()
-    session.headers.update({
-        **DEFAULT_HEADERS,
-        "Referer": "https://www.bizbuysell.com/",
-        "Cache-Control": "no-cache",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin",
-    })
-
-    html = fetch_page(BIZBUYSELL_URL, session=session)
+    html = fetch_page(BIZBUYSELL_URL)
     if not html:
         return []
 
@@ -169,7 +178,7 @@ def scrape_bizbuysell() -> list:
     listings = []
     seen_ids = set()
 
-    # Try multiple CSS selector patterns — BizBuySell changes their HTML periodically
+    # Try multiple CSS selector patterns
     card_selectors = [
         "a[href*='/business-for-sale/']",
         "a[href*='/businesses-for-sale/']",
@@ -241,11 +250,7 @@ BIZFORSALE_URL = (
 def scrape_businessesforsale() -> list:
     """Scrape BusinessesForSale.com Miami-Dade/Palm Beach/Broward listings."""
     log.info("Scraping BusinessesForSale.com...")
-    html = fetch_page(BIZFORSALE_URL, headers={
-        "Referer": "https://us.businessesforsale.com/",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    })
+    html = fetch_page(BIZFORSALE_URL)
     if not html:
         return []
 
@@ -376,7 +381,7 @@ def build_html_email(new_listings: list) -> str:
     <hr style="border:none; border-top:1px solid #e5e7eb; margin:24px 0 16px;">
     <p style="font-size:12px; color:#9ca3af; margin:0;">
       Keywords monitored: {', '.join(KEYWORDS)}<br>
-      Sources: BizMLS &bull; BizBuySell &bull; BusinessesForSale.com
+      Sources: BizMLS (Miami-Dade, Palm Beach, Broward) &bull; BizBuySell &bull; BusinessesForSale.com
     </p>
   </div>
 </body>
