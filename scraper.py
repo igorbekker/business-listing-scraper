@@ -114,7 +114,7 @@ def scrape_bizmls() -> list:
         ("process",     "search"),
         ("country",     "USA"),
         ("disp_cat",    "est"),
-        ("howdisplay",  "freeform"),
+        ("howdisplay",  "ol"),
         ("pricemin",    "-99999999"),
         ("pricemax",    "999999999"),
         ("net_income",  "-999999999"),
@@ -128,7 +128,7 @@ def scrape_bizmls() -> list:
         ("list",        ""),
         ("sp",          ""),
         ("lastcatval",  ""),
-        ("displayall",  ""),
+        ("displayall",  "Y"),
         ("usealt",      ""),
         ("sic_code",    ""),
         ("salesmin",    ""),
@@ -175,7 +175,7 @@ def scrape_bizmls() -> list:
 
         soup = BeautifulSoup(resp.text, "lxml")
         all_hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
-        log.info("BizMLS: total hrefs found: %d, sample: %s", len(all_hrefs), str(all_hrefs[:30]))
+        log.info("BizMLS: total hrefs found: %d, ALL: %s", len(all_hrefs), str(all_hrefs))
 
         for a_tag in soup.find_all("a", href=True):
             href = a_tag["href"]
