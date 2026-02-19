@@ -3,6 +3,10 @@
 Business Listing Scraper
 Scrapes 3 business listing websites and emails new keyword-matching listings.
 Runs via GitHub Actions cron schedule (no local PC required).
+
+- BizMLS: POST form (server-side rendered, no bot protection)
+- BizBuySell: Playwright + stealth (heavy bot protection)
+- BusinessesForSale.com: Playwright + stealth (heavy bot protection)
 """
 
 import json
@@ -18,6 +22,8 @@ from typing import Optional
 
 import cloudscraper
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from playwright_stealth import stealth_sync
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -26,8 +32,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Shared cloudscraper instance (bypasses Cloudflare/bot protection) ─────────
-scraper = cloudscraper.create_scraper(
+# ── Shared cloudscraper instance (used for BizMLS) ────────────────────────────
+cs = cloudscraper.create_scraper(
     browser={"browser": "chrome", "platform": "windows", "mobile": False}
 )
 
@@ -42,21 +48,21 @@ GMAIL_USER = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 RECIPIENT = "bekker.igor@gmail.com"
 
-REQUEST_TIMEOUT = 20        # seconds per request
+REQUEST_TIMEOUT = 20
 RETRY_ATTEMPTS = 3
-RETRY_DELAY = 6             # seconds between retries
-INTER_SITE_DELAY = 4        # seconds between sites
+RETRY_DELAY = 6
+INTER_SITE_DELAY = 4
 
 
-# ── Utility: fetch with retry ──────────────────────────────────────────────────
+# ── Utility: cloudscraper fetch with retry ────────────────────────────────────
 def fetch_page(url: str, method: str = "GET", data: dict = None) -> Optional[str]:
-    """Fetch URL with retry logic using cloudscraper. Returns HTML or None."""
+    """Fetch URL using cloudscraper with retry logic. Returns HTML or None."""
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
             if method == "POST":
-                resp = scraper.post(url, data=data, timeout=REQUEST_TIMEOUT)
+                resp = cs.post(url, data=data, timeout=REQUEST_TIMEOUT)
             else:
-                resp = scraper.get(url, timeout=REQUEST_TIMEOUT)
+                resp = cs.get(url, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             return resp.text
         except Exception as exc:
@@ -67,16 +73,65 @@ def fetch_page(url: str, method: str = "GET", data: dict = None) -> Optional[str
     return None
 
 
+# ── Utility: Playwright fetch (bypasses JS bot detection) ─────────────────────
+def fetch_with_playwright(url: str, wait_for: str = "networkidle") -> Optional[str]:
+    """Fetch a page using headless Playwright with stealth mode. Returns HTML or None."""
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/121.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+            )
+            page = context.new_page()
+            stealth_sync(page)
+            page.goto(url, wait_until=wait_for, timeout=45000)
+            # Extra wait to let dynamic content render
+            time.sleep(3)
+            html = page.content()
+            browser.close()
+            return html
+    except PlaywrightTimeout:
+        log.warning("Playwright timeout for %s, retrying with domcontentloaded...", url)
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                context = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/121.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1280, "height": 800},
+                )
+                page = context.new_page()
+                stealth_sync(page)
+                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                time.sleep(5)
+                html = page.content()
+                browser.close()
+                return html
+        except Exception as exc:
+            log.error("Playwright retry also failed for %s: %s", url, exc)
+            return None
+    except Exception as exc:
+        log.error("Playwright failed for %s: %s", url, exc)
+        return None
+
+
 # ── Utility: Keyword matching ──────────────────────────────────────────────────
 def matches_keywords(title: str) -> bool:
-    """Return True if the listing title contains any target keyword."""
     lower = title.lower()
     return any(kw in lower for kw in KEYWORDS)
 
 
 # ── Seen-listings persistence ──────────────────────────────────────────────────
 def load_seen() -> dict:
-    """Load seen_listings.json. Returns empty dict if file missing or corrupt."""
     try:
         with open(SEEN_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -86,19 +141,16 @@ def load_seen() -> dict:
 
 
 def save_seen(seen: dict) -> None:
-    """Persist updated seen_listings.json."""
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(seen, f, indent=2)
 
 
 # ── Site 1: BizMLS ────────────────────────────────────────────────────────────
-# BizMLS uses a POST form to return results, filtered by county.
-# We submit 3 separate POST requests for Miami-Dade, Palm Beach, and Broward.
 BIZMLS_POST_URL = "https://bizmls.com/cgi-bin/a-bus2.asp"
 BIZMLS_COUNTIES = ["Miami-Dade", "Palm Beach", "Broward"]
 
 def scrape_bizmls() -> list:
-    """Scrape BizMLS listings for Miami-Dade, Palm Beach, and Broward counties."""
+    """Scrape BizMLS listings via POST for Miami-Dade, Palm Beach, and Broward."""
     log.info("Scraping BizMLS (3 counties)...")
     listings = []
     seen_ids = set()
@@ -117,24 +169,39 @@ def scrape_bizmls() -> list:
             log.warning("BizMLS: no response for county %s", county)
             continue
 
-        # Debug: show first 300 chars to verify we got results not just a form
-        log.info("BizMLS %s HTML preview: %s", county, html[:300].replace("\n", " "))
-
         soup = BeautifulSoup(html, "lxml")
 
-        # Scan all <a> tags — listing links typically contain listno= or a-bus3.asp
+        # Log ALL hrefs found to diagnose which patterns contain listings
+        all_hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
+        log.info("BizMLS %s: all hrefs found (%d): %s", county, len(all_hrefs), str(all_hrefs[:30]))
+
+        # Try broad matching — any link containing .asp with a query string,
+        # OR containing common listing ID patterns
         for a_tag in soup.find_all("a", href=True):
             href = a_tag["href"]
 
-            # Match any link that looks like a listing detail page
-            if not any(p in href for p in ["listno=", "a-bus3", "a-bus4", "detail"]):
+            # Match listing detail links — try many possible patterns
+            is_listing_link = any(p in href.lower() for p in [
+                "listno=", "a-bus3", "a-bus4", "a-bus5",
+                "detail", "listing", "id=", "lid=", "bno=",
+                "busno=", "bizno=", "listid=",
+            ])
+
+            # Also match any .asp link that has a query string (likely a detail page)
+            if not is_listing_link and ".asp?" in href.lower():
+                is_listing_link = True
+
+            if not is_listing_link:
                 continue
 
             title = a_tag.get_text(strip=True)
             if not title or len(title) < 3:
                 continue
 
-            # Build absolute URL
+            # Skip nav links by title
+            if title.lower() in {"home", "search", "login", "join", "contact", "about"}:
+                continue
+
             if href.startswith("http"):
                 full_url = href
             elif href.startswith("/"):
@@ -142,7 +209,6 @@ def scrape_bizmls() -> list:
             else:
                 full_url = "https://bizmls.com/cgi-bin/" + href
 
-            # Use listno value as ID, fall back to full href
             match = re.search(r"listno=(\w+)", href, re.IGNORECASE)
             listing_id = match.group(1) if match else href
 
@@ -155,7 +221,7 @@ def scrape_bizmls() -> list:
                     "source": f"BizMLS ({county})"
                 })
 
-        time.sleep(2)  # small delay between county requests
+        time.sleep(2)
 
     log.info("BizMLS: found %d total candidate listings across 3 counties", len(listings))
     return listings
@@ -168,9 +234,9 @@ BIZBUYSELL_URL = (
 )
 
 def scrape_bizbuysell() -> list:
-    """Scrape BizBuySell Florida listings."""
-    log.info("Scraping BizBuySell...")
-    html = fetch_page(BIZBUYSELL_URL)
+    """Scrape BizBuySell Florida listings using Playwright stealth."""
+    log.info("Scraping BizBuySell with Playwright...")
+    html = fetch_with_playwright(BIZBUYSELL_URL)
     if not html:
         return []
 
@@ -178,7 +244,11 @@ def scrape_bizbuysell() -> list:
     listings = []
     seen_ids = set()
 
-    # Try multiple CSS selector patterns
+    # Log a sample of hrefs for diagnostics
+    all_hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
+    log.info("BizBuySell: total hrefs found: %d, sample: %s", len(all_hrefs), str(all_hrefs[:20]))
+
+    # Try multiple selector strategies
     card_selectors = [
         "a[href*='/business-for-sale/']",
         "a[href*='/businesses-for-sale/']",
@@ -192,7 +262,7 @@ def scrape_bizbuysell() -> list:
         cards = soup.select(selector)
         if not cards:
             continue
-        log.info("BizBuySell: selector '%s' found %d elements", selector, len(cards))
+        log.info("BizBuySell: selector '%s' matched %d elements", selector, len(cards))
         for a_tag in cards:
             href = a_tag.get("href", "")
             if not href or ("business-for-sale" not in href and "bizbuysell.com" not in href):
@@ -216,7 +286,7 @@ def scrape_bizbuysell() -> list:
 
     # Fallback: broad link scan
     if not listings:
-        log.info("BizBuySell: trying fallback link scan")
+        log.info("BizBuySell: trying fallback broad link scan")
         for a_tag in soup.find_all("a", href=True):
             href = a_tag["href"]
             if "business-for-sale" not in href:
@@ -248,15 +318,19 @@ BIZFORSALE_URL = (
 )
 
 def scrape_businessesforsale() -> list:
-    """Scrape BusinessesForSale.com Miami-Dade/Palm Beach/Broward listings."""
-    log.info("Scraping BusinessesForSale.com...")
-    html = fetch_page(BIZFORSALE_URL)
+    """Scrape BusinessesForSale.com using Playwright stealth."""
+    log.info("Scraping BusinessesForSale.com with Playwright...")
+    html = fetch_with_playwright(BIZFORSALE_URL)
     if not html:
         return []
 
     soup = BeautifulSoup(html, "lxml")
     listings = []
     seen_ids = set()
+
+    # Log hrefs for diagnostics
+    all_hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
+    log.info("BusinessesForSale: total hrefs: %d, sample: %s", len(all_hrefs), str(all_hrefs[:20]))
 
     card_selectors = [
         "article.listing a",
@@ -273,7 +347,7 @@ def scrape_businessesforsale() -> list:
         cards = soup.select(selector)
         if not cards:
             continue
-        log.info("BusinessesForSale: selector '%s' found %d elements", selector, len(cards))
+        log.info("BusinessesForSale: selector '%s' matched %d elements", selector, len(cards))
         for a_tag in cards:
             href = a_tag.get("href", "")
             if not href or "businesses-for-sale" not in href:
@@ -297,7 +371,7 @@ def scrape_businessesforsale() -> list:
 
     # Fallback: broad link scan
     if not listings:
-        log.info("BusinessesForSale: trying fallback link scan")
+        log.info("BusinessesForSale: trying fallback broad link scan")
         for a_tag in soup.find_all("a", href=True):
             href = a_tag["href"]
             if "businesses-for-sale" not in href:
@@ -323,9 +397,7 @@ def scrape_businessesforsale() -> list:
 
 # ── Email ─────────────────────────────────────────────────────────────────────
 def build_html_email(new_listings: list) -> str:
-    """Build a nicely formatted HTML email body."""
     run_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-
     by_source = {}
     for listing in new_listings:
         by_source.setdefault(listing["source"], []).append(listing)
@@ -370,9 +442,7 @@ def build_html_email(new_listings: list) -> str:
 <body style="font-family:Arial,sans-serif; background:#f9fafb; padding:20px; color:#111827;">
   <div style="max-width:800px; margin:0 auto; background:#fff; border-radius:8px;
               box-shadow:0 1px 3px rgba(0,0,0,0.1); padding:30px;">
-    <h1 style="font-size:20px; color:#111827; margin:0 0 4px;">
-      New Business Listings Alert
-    </h1>
+    <h1 style="font-size:20px; color:#111827; margin:0 0 4px;">New Business Listings Alert</h1>
     <p style="color:#6b7280; font-size:14px; margin:0 0 20px;">
       Run time: {run_time} &nbsp;|&nbsp; {len(new_listings)} new matching listing(s) found
     </p>
@@ -380,7 +450,7 @@ def build_html_email(new_listings: list) -> str:
     {sections}
     <hr style="border:none; border-top:1px solid #e5e7eb; margin:24px 0 16px;">
     <p style="font-size:12px; color:#9ca3af; margin:0;">
-      Keywords monitored: {', '.join(KEYWORDS)}<br>
+      Keywords: {', '.join(KEYWORDS)}<br>
       Sources: BizMLS (Miami-Dade, Palm Beach, Broward) &bull; BizBuySell &bull; BusinessesForSale.com
     </p>
   </div>
@@ -389,7 +459,6 @@ def build_html_email(new_listings: list) -> str:
 
 
 def send_email(new_listings: list) -> None:
-    """Send HTML email via Gmail SMTP."""
     subject = (
         f"[Business Alert] {len(new_listings)} New Listing(s) Found "
         f"– {datetime.utcnow().strftime('%Y-%m-%d')}"

@@ -3,7 +3,6 @@ name: Business Listing Scraper
 on:
   schedule:
     # Runs at 08:00, 13:00, and 18:00 UTC daily
-    # Note: GitHub Actions cron can be delayed ~60 min during high load
     - cron: "0 8 * * *"
     - cron: "0 13 * * *"
     - cron: "0 18 * * *"
@@ -17,7 +16,7 @@ jobs:
   scrape:
     name: Scrape and Email
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
@@ -33,6 +32,9 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: playwright install chromium --with-deps
 
       - name: Run scraper
         env:
