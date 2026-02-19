@@ -38,6 +38,9 @@ cs = cloudscraper.create_scraper(
 )
 
 # ── Configuration ──────────────────────────────────────────────────────────────
+KEYWORDS_FILE = "keywords.json"
+SEEN_FILE = "seen_listings.json"
+
 def load_keywords() -> list:
     """Load keywords from keywords.json. Falls back to empty list if missing."""
     try:
@@ -52,9 +55,6 @@ def load_keywords() -> list:
     return []
 
 KEYWORDS = load_keywords()
-
-KEYWORDS_FILE = "keywords.json"
-SEEN_FILE = "seen_listings.json"
 GMAIL_USER = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 RECIPIENT = "bekker.igor@gmail.com"
