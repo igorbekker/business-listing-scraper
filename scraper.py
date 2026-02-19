@@ -38,11 +38,22 @@ cs = cloudscraper.create_scraper(
 )
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-KEYWORDS = [
-    "adult", "home care", "coin", "laundromat", "car wash",
-    "nemt", "medical transportation", "laundry", "psychology", "adult care"
-]
+def load_keywords() -> list:
+    """Load keywords from keywords.json. Falls back to empty list if missing."""
+    try:
+        with open(KEYWORDS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                kws = [str(k).strip().lower() for k in data if str(k).strip()]
+                log.info("Loaded %d keywords from %s: %s", len(kws), KEYWORDS_FILE, kws)
+                return kws
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        log.error("Could not load %s: %s — no keywords active!", KEYWORDS_FILE, e)
+    return []
 
+KEYWORDS = load_keywords()
+
+KEYWORDS_FILE = "keywords.json"
 SEEN_FILE = "seen_listings.json"
 GMAIL_USER = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
