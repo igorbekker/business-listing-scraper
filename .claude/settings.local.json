@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(test:*)",
+      "WebFetch(domain:bizmls.com)",
+      "WebFetch(domain:www.bizbuysell.com)",
+      "WebFetch(domain:us.businessesforsale.com)",
+      "WebFetch(domain:github.com)"
+    ]
+  }
+}

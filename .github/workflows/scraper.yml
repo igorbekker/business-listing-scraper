@@ -1,0 +1,49 @@
+name: Business Listing Scraper
+
+on:
+  schedule:
+    # Runs at 08:00, 13:00, and 18:00 UTC daily
+    # Note: GitHub Actions cron can be delayed ~60 min during high load
+    - cron: "0 8 * * *"
+    - cron: "0 13 * * *"
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    # Allows manual runs from the GitHub Actions UI (for testing)
+
+permissions:
+  contents: write   # Required to commit seen_listings.json back to the repo
+
+jobs:
+  scrape:
+    name: Scrape and Email
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python scraper.py
+
+      - name: Commit updated seen_listings.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add seen_listings.json
+          git diff --staged --quiet || git commit -m "chore: update seen_listings.json [skip ci]"
+          git push || true
