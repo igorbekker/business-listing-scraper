@@ -180,6 +180,13 @@ def scrape_bizmls() -> list:
         # Pattern: "Listing Number : BBF-1283-00073" and blue title links
         text = resp.text
 
+        # Log raw snippet around "Listing Number" to debug regex
+        idx = text.find("Listing Number")
+        if idx >= 0:
+            log.info("BizMLS: 'Listing Number' context: %r", text[idx:idx+80])
+        else:
+            log.info("BizMLS: 'Listing Number' not found in response — logging 3000-5000 chars: %s", text[3000:5000])
+
         # Find all listing blocks: each has a listing number and a category title
         list_numbers = re.findall(r'Listing Number\s*[:\s]+([A-Z0-9\-]+)', text)
         log.info("BizMLS: found %d listing numbers", len(list_numbers))
