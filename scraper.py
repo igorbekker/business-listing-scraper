@@ -174,47 +174,34 @@ def scrape_bizmls() -> list:
         log.info("BizMLS POST response (first 2000 chars): %s", resp.text[:2000])
 
         soup = BeautifulSoup(resp.text, "lxml")
-        all_hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
-        log.info("BizMLS: total hrefs found: %d, ALL: %s", len(all_hrefs), str(all_hrefs))
 
-        for a_tag in soup.find_all("a", href=True):
-            href = a_tag["href"]
-            is_listing_link = any(p in href.lower() for p in [
-                "listno=", "a-bus3", "a-bus4", "a-bus5",
-                "detail", "lid=", "bno=", "busno=", "bizno=", "listid=",
-            ])
-            if not is_listing_link:
+        # Listings are JS-rendered with #p1 anchors. The listing number and title
+        # are in the raw HTML. Parse them directly.
+        # Pattern: "Listing Number : BBF-1283-00073" and blue title links
+        text = resp.text
+
+        # Find all listing blocks: each has a listing number and a category title
+        list_numbers = re.findall(r'Listing Number\s*[:\s]+([A-Z0-9\-]+)', text)
+        log.info("BizMLS: found %d listing numbers", len(list_numbers))
+
+        # Find titles — they appear as blue links before each listing number
+        # Title pattern: <a ...>Category : Detail</a>
+        title_pattern = re.compile(r'<a[^>]+class=["\']?[^"\']*blue[^"\']*["\']?[^>]*>([^<]+)</a>', re.IGNORECASE)
+        titles = [m.group(1).strip() for m in title_pattern.finditer(text)]
+        log.info("BizMLS: found %d titles", len(titles))
+
+        for i, list_num in enumerate(list_numbers):
+            if list_num in seen_ids:
                 continue
-
-            title = a_tag.get_text(strip=True)
-            if not title or len(title) < 3:
-                row = a_tag.find_parent("tr")
-                if row:
-                    title = row.get_text(separator=" ", strip=True)[:100]
-            if not title or len(title) < 3:
-                continue
-            if title.lower() in {"home", "search", "login", "join", "contact", "about", "finance", "brokers"}:
-                continue
-
-            if href.startswith("http"):
-                full_url = href
-            elif href.startswith("/"):
-                full_url = "https://bizmls.com" + href
-            else:
-                full_url = "https://bizmls.com/cgi-bin/" + href.lstrip("../")
-
-            match = re.search(r"listno=(\w+)", href, re.IGNORECASE)
-            listing_id = match.group(1) if match else href
-
-            if listing_id not in seen_ids:
-                seen_ids.add(listing_id)
-                # Determine county label from listing URL if possible
-                listings.append({
-                    "id": listing_id,
-                    "title": title,
-                    "url": full_url,
-                    "source": "BizMLS",
-                })
+            seen_ids.add(list_num)
+            title = titles[i] if i < len(titles) else list_num
+            url = f"https://bizmls.com/cgi-bin/a-bus-d.asp?folder=BIZMLS&LIST_NUMBER={list_num}"
+            listings.append({
+                "id": list_num,
+                "title": title,
+                "url": url,
+                "source": "BizMLS",
+            })
 
     except Exception as exc:
         log.error("BizMLS POST failed: %s", exc, exc_info=True)
